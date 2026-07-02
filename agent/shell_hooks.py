@@ -519,10 +519,38 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[Dict[str, Any]
     return _callback
 
 
+def _session_context_payload() -> Dict[str, str]:
+    """Return the allowlisted gateway session context for shell-hook payloads.
+
+    Keep this intentionally narrow: hook consumers may forward it to local UIs,
+    so it must never grow into raw gateway metadata or user/message content.
+    """
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return {}
+
+    mapping = {
+        "platform": "HERMES_SESSION_PLATFORM",
+        "chat_id": "HERMES_SESSION_CHAT_ID",
+        "chat_name": "HERMES_SESSION_CHAT_NAME",
+        "thread_id": "HERMES_SESSION_THREAD_ID",
+    }
+    context: Dict[str, str] = {}
+    for key, env_name in mapping.items():
+        value = str(get_session_env(env_name, "") or "").strip()
+        if value:
+            context[key] = value
+    return context
+
+
 def _serialize_payload(event: str, kwargs: Dict[str, Any]) -> str:
     """Render the stdin JSON payload.  Unserialisable values are
     stringified via ``default=str`` rather than dropped."""
     extras = {k: v for k, v in kwargs.items() if k not in _TOP_LEVEL_PAYLOAD_KEYS}
+    session_context = _session_context_payload()
+    if session_context:
+        extras["session_context"] = session_context
     try:
         cwd = str(Path.cwd())
     except OSError:

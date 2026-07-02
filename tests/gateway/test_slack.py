@@ -150,7 +150,26 @@ class TestSlashCommandSessionIsolation:
         assert event.source.user_id == "U123"
 
     @pytest.mark.asyncio
+    async def test_channel_slash_command_resolves_channel_name(self, adapter):
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "eng-runtime", "is_im": False}}
+        )
+        command = {
+            "text": "hello",
+            "user_id": "U123",
+            "channel_id": "C123",
+            "team_id": "T123",
+        }
+
+        await adapter._handle_slash_command(command)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.chat_name == "eng-runtime"
+        adapter._app.client.conversations_info.assert_awaited_once_with(channel="C123")
+
+    @pytest.mark.asyncio
     async def test_dm_slash_command_keeps_dm_session_semantics(self, adapter):
+        adapter._app.client.conversations_info = AsyncMock(side_effect=AssertionError("DM lookup leaked"))
         command = {
             "text": "hello",
             "user_id": "U123",
@@ -164,7 +183,9 @@ class TestSlashCommandSessionIsolation:
         event = adapter.handle_message.await_args.args[0]
         assert event.source.chat_type == "dm"
         assert event.source.chat_id == "D123"
+        assert event.source.chat_name == "D123"
         assert event.source.user_id == "U123"
+        adapter._app.client.conversations_info.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1150,6 +1171,22 @@ class TestBangPrefixCommands:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text.startswith("/queue")
         assert msg_event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_channel_message_resolves_channel_name(self, adapter):
+        adapter.config.extra["require_mention"] = False
+        adapter._resolve_user_name = AsyncMock(return_value="User")
+        adapter._app.client.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "eng-runtime", "is_im": False}}
+        )
+
+        await adapter._handle_slack_message(
+            self._make_event("hello", channel_type="channel", channel="C123")
+        )
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.source.chat_name == "eng-runtime"
+        adapter._app.client.conversations_info.assert_awaited_once_with(channel="C123")
 
     @pytest.mark.asyncio
     async def test_bang_command_with_args_preserved(self, adapter):

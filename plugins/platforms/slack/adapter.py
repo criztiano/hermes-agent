@@ -446,6 +446,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
         self._channel_team: Dict[str, str] = {}  # channel_id → team_id
+        self._channel_name_cache: Dict[str, str] = {}  # channel_id → safe display name
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -1348,6 +1349,38 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
+
+    async def _resolve_channel_display_name(self, channel_id: str, *, is_dm: bool = False) -> str:
+        """Return a safe Slack display name for channel/session labels.
+
+        Public/private channel names are useful context for local hook displays;
+        DMs and group DMs intentionally stay as opaque Slack IDs so Hooker does
+        not surface user identities.
+        """
+        channel_id = str(channel_id or "").strip()
+        if not channel_id:
+            return ""
+        if is_dm:
+            return channel_id
+        cached = self._channel_name_cache.get(channel_id)
+        if cached:
+            return cached
+        try:
+            info = await self.get_chat_info(channel_id)
+        except Exception:
+            logger.debug(
+                "[Slack] Could not resolve channel display name for %s",
+                channel_id,
+                exc_info=True,
+            )
+            return channel_id
+        if str(info.get("type") or "").lower() == "dm":
+            return channel_id
+        name = str(info.get("name") or "").strip()
+        if not name or name == channel_id:
+            return channel_id
+        self._channel_name_cache[channel_id] = name
+        return name
 
     async def send(
         self,
@@ -3151,10 +3184,12 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve user display name (cached after first lookup)
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id)
 
+        chat_name = await self._resolve_channel_display_name(channel_id, is_dm=is_dm)
+
         # Build source
         source = self.build_source(
             chat_id=channel_id,
-            chat_name=channel_id,  # Will be resolved later if needed
+            chat_name=chat_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
             user_name=user_name,
@@ -3943,8 +3978,10 @@ class SlackAdapter(BasePlatformAdapter):
         # keep group semantics so different users do not collide into one
         # session key.
         is_dm = str(channel_id).startswith("D")
+        chat_name = await self._resolve_channel_display_name(channel_id, is_dm=is_dm)
         source = self.build_source(
             chat_id=channel_id,
+            chat_name=chat_name,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
         )

@@ -179,6 +179,38 @@ class TestSerializePayload:
         payload = json.loads(raw)
         assert payload["session_id"] == "p-1"
 
+    def test_allowlisted_session_context_included_without_identity(self):
+        from gateway.session_context import clear_session_vars, set_session_vars
+
+        tokens = set_session_vars(
+            platform="slack",
+            chat_id="C123",
+            chat_name="eng-runtime",
+            thread_id="171.42",
+            user_id="U123",
+            user_name="Alice",
+            session_key="session-secret",
+            message_id="msg-secret",
+        )
+        try:
+            raw = shell_hooks._serialize_payload("pre_llm_call", {"user_message": "secret prompt"})
+        finally:
+            clear_session_vars(tokens)
+
+        payload = json.loads(raw)
+        assert payload["extra"]["session_context"] == {
+            "platform": "slack",
+            "chat_id": "C123",
+            "chat_name": "eng-runtime",
+            "thread_id": "171.42",
+        }
+        encoded = json.dumps(payload["extra"]["session_context"])
+        assert "U123" not in encoded
+        assert "Alice" not in encoded
+        assert "session-secret" not in encoded
+        assert "msg-secret" not in encoded
+        assert "secret prompt" not in encoded
+
     def test_unserialisable_extras_stringified(self):
         class Weird:
             def __repr__(self) -> str:
