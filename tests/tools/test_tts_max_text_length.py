@@ -147,6 +147,37 @@ class TestTextToSpeechToolTruncation:
         # And the warning should mention the provider
         assert any("openai" in rec.message.lower() for rec in caplog.records)
 
+    def test_strict_mode_rejects_over_cap_text_without_generation(
+        self, tmp_path, monkeypatch
+    ):
+        text = "A" * 5000
+
+        def unexpected_generation(*_args, **_kwargs):
+            raise AssertionError("strict mode must reject before provider generation")
+
+        monkeypatch.setattr(
+            "tools.tts_tool._generate_openai_tts", unexpected_generation
+        )
+        monkeypatch.setattr(
+            "tools.tts_tool._load_tts_config", lambda: {"provider": "openai"}
+        )
+
+        from tools.tts_tool import text_to_speech_tool
+
+        out = str(tmp_path / "out.mp3")
+        result = json.loads(
+            text_to_speech_tool(
+                text=text,
+                output_path=out,
+                _strict_max_length=True,
+            )
+        )
+
+        assert result["success"] is False
+        assert result["max_text_length"] == 4096
+        assert result["text_length"] == 5000
+        assert not (tmp_path / "out.mp3").exists()
+
     def test_xai_accepts_much_longer_input(self, tmp_path, monkeypatch):
         # 12000 chars -- over old global 4000, under xAI's 15000
         text = "B" * 12000

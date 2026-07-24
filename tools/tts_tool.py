@@ -2287,6 +2287,8 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
+    *,
+    _strict_max_length: bool = False,
 ) -> str:
     """
     Convert text to speech audio.
@@ -2301,6 +2303,7 @@ def text_to_speech_tool(
     Args:
         text: The text to convert to speech.
         output_path: Optional custom save path. Defaults to ~/voice-memos/<timestamp>.mp3
+        _strict_max_length: Internal callers can reject over-cap text instead of truncating.
 
     Returns:
         str: JSON result with success, file_path, and optionally MEDIA tag.
@@ -2321,6 +2324,19 @@ def text_to_speech_tool(
     # (OpenAI 4096, xAI 15k, MiniMax 10k, ElevenLabs model-aware, etc.).
     max_len = _resolve_max_text_length(provider, tts_config)
     if len(text) > max_len:
+        if _strict_max_length:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": (
+                        f"Text exceeds the configured {provider} TTS limit "
+                        f"of {max_len} characters"
+                    ),
+                    "max_text_length": max_len,
+                    "text_length": len(text),
+                },
+                ensure_ascii=False,
+            )
         logger.warning(
             "TTS text too long for provider %s (%d chars), truncating to %d",
             provider, len(text), max_len,

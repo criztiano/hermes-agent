@@ -264,6 +264,25 @@ Step 1, Option A) that declares every command in
 as a slash command. In Socket Mode, Slack routes the command event
 through the WebSocket regardless of the manifest's `url` field.
 
+### Read aloud message shortcut
+
+Hermes adds **Read aloud** to the three-dot menu on Slack messages. Select it
+to synthesize that message's plain text with your configured Hermes TTS
+provider and voice. The audio is sent privately to **your DM with Hermes**; it
+is never posted in the channel where the selected message appeared. Slack
+users must still pass the normal `SLACK_ALLOWED_USERS`/pairing authorization
+checks before Hermes will run TTS.
+
+After upgrading Hermes, regenerate the app manifest and apply it to the Slack
+app, then reinstall the app when Slack prompts you:
+
+```bash
+hermes slack manifest --agent-view --write
+```
+
+Refreshing and reinstalling the manifest is required before **Read aloud**
+appears in the message menu.
+
 ### Agent messaging experience
 
 New Slack apps use Slack's **Agent** messaging experience. Existing Hermes

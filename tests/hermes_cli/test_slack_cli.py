@@ -280,6 +280,22 @@ class TestSlackFullManifest:
             "messages_tab_read_only_enabled": False,
         }
 
+    def test_read_aloud_message_shortcut_is_included(self):
+        manifest = _build_full_manifest(
+            "Hermes",
+            "Your Hermes agent on Slack",
+            messaging_experience="agent",
+        )
+
+        assert manifest["features"]["shortcuts"] == [
+            {
+                "name": "Read aloud",
+                "type": "message",
+                "callback_id": "hermes_read_aloud",
+                "description": "Send this message as audio to your Hermes DM.",
+            }
+        ]
+
     def test_private_channel_directory_scope_is_included(self):
         manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
 

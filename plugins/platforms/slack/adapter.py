@@ -10,11 +10,13 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+import html
 import inspect
 import json
 import logging
 import os
 import re
+import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -66,6 +68,8 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 
 logger = logging.getLogger(__name__)
+
+HERMES_READ_ALOUD_SHORTCUT_ID = "hermes_read_aloud"
 
 # User-Agent prefix for outbound Slack API calls so platform partners can
 # identify HermesAgent traffic — matching other Hermes outbound surfaces
@@ -940,6 +944,11 @@ class SlackAdapter(BasePlatformAdapter):
         # produce a second reply. max_size bounds memory, so the long window
         # is safe.
         self._dedup = MessageDeduplicator(ttl_seconds=_slack_dedup_ttl_seconds())
+        # Read-aloud runs outside the main agent loop but still uses paid or
+        # capacity-limited TTS backends. Keep at most two authorized requests
+        # active and deduplicate Slack retries by trigger_id via _dedup.
+        self._read_aloud_in_flight: set[Tuple[str, str]] = set()
+        self._READ_ALOUD_MAX_IN_FLIGHT: int = 2
         # Original Slack message timestamps that were routed into the agent.
         # Used to avoid duplicate responses when an already-addressed message
         # is later edited.
@@ -2071,6 +2080,13 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 await self._handle_slash_command(command)
 
+            # Deterministic message shortcut: ACK immediately, then synthesize
+            # the selected plain-text message and deliver audio only in the
+            # invoking user's DM. This path never enters the main agent loop.
+            @self._app.shortcut(HERMES_READ_ALOUD_SHORTCUT_ID)
+            async def handle_read_aloud_shortcut(ack, body):
+                await self._handle_read_aloud_shortcut(ack, body)
+
             # Register Block Kit action handlers for approval buttons
             for _action_id in (
                 "hermes_approve_once",
@@ -2346,7 +2362,11 @@ class SlackAdapter(BasePlatformAdapter):
         return self._app.client  # fallback to primary
 
     async def _ensure_dm_conversation(
-        self, chat_id: str, team_id: Optional[str] = None
+        self,
+        chat_id: str,
+        team_id: Optional[str] = None,
+        *,
+        client_override: Optional[Any] = None,
     ) -> str:
         """Resolve a bare Slack user ID target to a DM conversation ID.
 
@@ -2369,9 +2389,8 @@ class SlackAdapter(BasePlatformAdapter):
         if cached:
             return cached
         try:
-            response = await self._get_client(cid, team_id=team_id).conversations_open(
-                users=cid
-            )
+            client = client_override or self._get_client(cid, team_id=team_id)
+            response = await client.conversations_open(users=cid)
             dm_id = ((response or {}).get("channel") or {}).get("id")
             if dm_id:
                 self._dm_conversation_cache[cache_key] = dm_id
@@ -2390,6 +2409,254 @@ class SlackAdapter(BasePlatformAdapter):
                 e,
             )
         return chat_id
+
+    async def _handle_read_aloud_shortcut(self, ack, body: Dict[str, Any]) -> None:
+        """Acknowledge Slack's message shortcut and process it off the ack path."""
+        await ack()
+        payload = body if isinstance(body, dict) else {}
+        trigger_id = str(payload.get("trigger_id") or "")
+        raw_team = payload.get("team")
+        team = raw_team if isinstance(raw_team, dict) else {}
+        team_id = str(team.get("id") or payload.get("team_id") or "")
+        if trigger_id and self._dedup.is_duplicate(
+            f"read-aloud:{team_id}:{trigger_id}"
+        ):
+            return
+        task = asyncio.create_task(self._process_read_aloud_shortcut(payload))
+        try:
+            self._background_tasks.add(task)
+        except TypeError:  # pragma: no cover - lightweight task doubles
+            return
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
+
+    async def _prepare_read_aloud_text(
+        self,
+        text: str,
+        *,
+        channel_id: str,
+        team_id: str,
+    ) -> str:
+        """Make Slack mrkdwn speakable without narrating opaque control tokens."""
+        text = html.unescape(text)
+        text = await self._humanize_user_mentions(
+            text, chat_id=channel_id, team_id=team_id
+        )
+        # If users.info could not resolve a mention, do not narrate its opaque
+        # workspace-local member ID.
+        text = re.sub(r"@(?:U|W)[A-Z0-9]{2,}\b", "a Slack user", text)
+        text = re.sub(
+            r"<#([A-Z0-9]+)(?:\|([^>\n]+))?>",
+            lambda match: f"#{match.group(2)}" if match.group(2) else "a Slack channel",
+            text,
+        )
+        text = re.sub(
+            r"<!(here|channel|everyone)(?:\|([^>\n]+))?>",
+            lambda match: f"@{match.group(2) or match.group(1)}",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"<(https?://[^>|\n]+)(?:\|([^>\n]+))?>",
+            lambda match: match.group(2) or match.group(1),
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(
+            r"<mailto:([^>|\n]+)(?:\|([^>\n]+))?>",
+            lambda match: match.group(2) or match.group(1),
+            text,
+            flags=re.IGNORECASE,
+        )
+        # Drop any unsupported Slack control payload rather than speaking it.
+        text = re.sub(r"<[^>\n]+>", "", text)
+        return text
+
+    async def _send_read_aloud_error(
+        self,
+        user_id: str,
+        team_id: str,
+        message: str,
+    ) -> None:
+        """Send a read-aloud failure only to the invoker's Slack DM."""
+        if not user_id:
+            logger.warning("[Slack] Read aloud failed without an invoking user id")
+            return
+        client = self._team_clients.get(team_id) if team_id else None
+        if client is None:
+            logger.warning(
+                "[Slack] Suppressed Read aloud error with no exact workspace route"
+            )
+            return
+        result = await self.send(
+            user_id,
+            message,
+            metadata={"slack_team_id": team_id},
+            _client_override=client,
+        )
+        if not result.success:
+            logger.warning(
+                "[Slack] Could not deliver private Read aloud error to %s: %s",
+                user_id,
+                result.error,
+            )
+
+    async def _process_read_aloud_shortcut(self, body: Dict[str, Any]) -> None:
+        """Synthesize selected Slack text and upload it only to the invoker's DM."""
+        raw_user = body.get("user")
+        raw_team = body.get("team")
+        raw_channel = body.get("channel")
+        raw_message = body.get("message")
+        user: Dict[str, Any] = raw_user if isinstance(raw_user, dict) else {}
+        team: Dict[str, Any] = raw_team if isinstance(raw_team, dict) else {}
+        channel: Dict[str, Any] = raw_channel if isinstance(raw_channel, dict) else {}
+        message: Dict[str, Any] = raw_message if isinstance(raw_message, dict) else {}
+        user_id = str(user.get("id") or body.get("user_id") or "")
+        team_id = str(team.get("id") or body.get("team_id") or "")
+        channel_id = str(channel.get("id") or message.get("channel") or "")
+        chat_type = "dm" if channel_id.startswith("D") else "group"
+
+        # Slack IDs are workspace-local. Never fall back to the primary client
+        # for private shortcut output when the payload has no exact team route.
+        if not team_id or team_id not in self._team_clients:
+            logger.warning(
+                "[Slack] Ignoring Read aloud shortcut with no exact workspace route"
+            )
+            return
+        workspace_client = self._team_clients[team_id]
+
+        # Fail closed when the gateway has not installed its authorization
+        # callback. It is the single source of truth for allowlists, pairing
+        # grants, and allow-all flags.
+        if self._is_sender_authorized(user_id, chat_type, channel_id) is not True:
+            await self._send_read_aloud_error(
+                user_id,
+                team_id,
+                "You are not authorized to use Hermes Read aloud.",
+            )
+            return
+
+        selected_text = message.get("text")
+        if not isinstance(selected_text, str) or not selected_text.strip():
+            await self._send_read_aloud_error(
+                user_id,
+                team_id,
+                "I couldn't read that aloud because the selected message has no readable text.",
+            )
+            return
+
+        spoken_text = await self._prepare_read_aloud_text(
+            selected_text,
+            channel_id=channel_id,
+            team_id=team_id,
+        )
+        if not spoken_text.strip():
+            await self._send_read_aloud_error(
+                user_id,
+                team_id,
+                "I couldn't read that aloud because the selected message has no readable text.",
+            )
+            return
+
+        request_key = (team_id, user_id)
+        if (
+            request_key in self._read_aloud_in_flight
+            or len(self._read_aloud_in_flight) >= self._READ_ALOUD_MAX_IN_FLIGHT
+        ):
+            await self._send_read_aloud_error(
+                user_id,
+                team_id,
+                "Read aloud is already busy. Try again in a moment.",
+            )
+            return
+        self._read_aloud_in_flight.add(request_key)
+
+        try:
+            from tools.tts_tool import (
+                _get_provider,
+                _load_tts_config,
+                _resolve_max_text_length,
+                text_to_speech_tool,
+            )
+
+            tts_config = _load_tts_config()
+            provider = _get_provider(tts_config)
+            max_text_length = _resolve_max_text_length(provider, tts_config)
+            if len(spoken_text) > max_text_length:
+                await self._send_read_aloud_error(
+                    user_id,
+                    team_id,
+                    "That message is too long for the configured TTS voice. Choose a shorter message.",
+                )
+                return
+
+            with tempfile.TemporaryDirectory(
+                prefix="hermes-slack-read-aloud-"
+            ) as temp_dir:
+                requested_path = str(_Path(temp_dir) / "read-aloud.mp3")
+                tts_worker = asyncio.create_task(
+                    asyncio.to_thread(
+                        text_to_speech_tool,
+                        text=spoken_text,
+                        output_path=requested_path,
+                        _strict_max_length=True,
+                    )
+                )
+                try:
+                    raw_result = await asyncio.shield(tts_worker)
+                except asyncio.CancelledError:
+                    # ``to_thread`` cannot stop an in-flight provider call. Keep
+                    # the temp directory alive until it exits, then propagate
+                    # cancellation without uploading stale audio after shutdown.
+                    await asyncio.shield(tts_worker)
+                    raise
+                try:
+                    tts_result = json.loads(raw_result)
+                except (TypeError, json.JSONDecodeError):
+                    tts_result = {"success": False}
+
+                if not tts_result.get("success") or not tts_result.get("file_path"):
+                    await self._send_read_aloud_error(
+                        user_id,
+                        team_id,
+                        "I couldn't synthesize that message. Check the configured TTS provider and try again.",
+                    )
+                    return
+
+                audio_path = _Path(str(tts_result["file_path"])).resolve()
+                temp_root = _Path(temp_dir).resolve()
+                if temp_root not in audio_path.parents or not audio_path.is_file():
+                    logger.error(
+                        "[Slack] Read aloud TTS returned an invalid temporary output path"
+                    )
+                    await self._send_read_aloud_error(
+                        user_id,
+                        team_id,
+                        "I couldn't synthesize that message. Check the configured TTS provider and try again.",
+                    )
+                    return
+
+                upload = await self.send_voice(
+                    user_id,
+                    str(audio_path),
+                    metadata={"slack_team_id": team_id},
+                    _client_override=workspace_client,
+                )
+                if not upload.success:
+                    await self._send_read_aloud_error(
+                        user_id,
+                        team_id,
+                        "I synthesized the message, but couldn't upload the audio to your DM. Please try again.",
+                    )
+        except Exception:
+            logger.error("[Slack] Read aloud shortcut failed", exc_info=True)
+            await self._send_read_aloud_error(
+                user_id,
+                team_id,
+                "I couldn't synthesize that message. Check the configured TTS provider and try again.",
+            )
+        finally:
+            self._read_aloud_in_flight.discard(request_key)
 
     async def _clear_thread_status_quietly(
         self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
@@ -2442,6 +2709,8 @@ class SlackAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        _client_override: Optional[Any] = None,
     ) -> SendResult:
         """Send a message to a Slack channel or DM."""
         if self._is_ignored_channel(chat_id):
@@ -2454,7 +2723,9 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         chat_id = await self._ensure_dm_conversation(
-            chat_id, team_id=self._metadata_team_id(metadata)
+            chat_id,
+            team_id=self._metadata_team_id(metadata),
+            client_override=_client_override,
         )
         thread_ts = None
         try:
@@ -2537,6 +2808,7 @@ class SlackAdapter(BasePlatformAdapter):
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
             blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            client = _client_override or self._get_client(chat_id, team_id=team_id)
 
             for i, chunk in enumerate(chunks):
                 kwargs = {
@@ -2553,9 +2825,7 @@ class SlackAdapter(BasePlatformAdapter):
                         kwargs["reply_broadcast"] = True
 
                 try:
-                    last_result = await self._get_client(
-                        chat_id, team_id=team_id
-                    ).chat_postMessage(**kwargs)
+                    last_result = await client.chat_postMessage(**kwargs)
                 except Exception as e:
                     if kwargs.get("blocks") and self._is_block_payload_rejection(e):
                         retry_kwargs = dict(kwargs)
@@ -2564,9 +2834,7 @@ class SlackAdapter(BasePlatformAdapter):
                             "[Slack] Block Kit payload rejected; retrying send without blocks: %s",
                             e,
                         )
-                        last_result = await self._get_client(
-                            chat_id, team_id=team_id
-                        ).chat_postMessage(**retry_kwargs)
+                        last_result = await client.chat_postMessage(**retry_kwargs)
                     else:
                         raise
 
@@ -3165,6 +3433,8 @@ class SlackAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        client_override: Optional[Any] = None,
     ) -> SendResult:
         """Upload a local file to Slack."""
         if self._is_ignored_channel(chat_id):
@@ -3179,16 +3449,18 @@ class SlackAdapter(BasePlatformAdapter):
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
 
+        team_id = self._metadata_team_id(metadata)
         chat_id = await self._ensure_dm_conversation(
-            chat_id, team_id=self._metadata_team_id(metadata)
+            chat_id,
+            team_id=team_id,
+            client_override=client_override,
         )
+        client = client_override or self._get_client(chat_id, team_id=team_id)
         thread_ts = self._resolve_thread_ts(reply_to, metadata)
         last_exc = None
         for attempt in range(3):
             try:
-                result = await self._get_client(
-                    chat_id, team_id=self._metadata_team_id(metadata)
-                ).files_upload_v2(
+                result = await client.files_upload_v2(
                     channel=chat_id,
                     file=file_path,
                     filename=os.path.basename(file_path),
@@ -4107,12 +4379,19 @@ class SlackAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        _client_override: Optional[Any] = None,
         **kwargs,
     ) -> SendResult:
         """Send an audio file to Slack."""
         try:
             return await self._upload_file(
-                chat_id, audio_path, caption, reply_to, metadata
+                chat_id,
+                audio_path,
+                caption,
+                reply_to,
+                metadata,
+                client_override=_client_override,
             )
         except FileNotFoundError:
             return SendResult(
