@@ -19,6 +19,8 @@ npub_to_hex = _buzz_mod.npub_to_hex
 _normalize_user_ref = _buzz_mod._normalize_user_ref
 _cli_error_message = _buzz_mod._cli_error_message
 _resolve_private_key = _buzz_mod._resolve_private_key
+_resolve_auth_tag = _buzz_mod._resolve_auth_tag
+_exec_buzz = _buzz_mod._exec_buzz
 check_requirements = _buzz_mod.check_requirements
 validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
@@ -45,7 +47,13 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_AUTH_TAG",
 )
+
+# Obviously-fake NIP-OA auth tags (four-string ["auth", …] shape). Never use
+# real credentials in tests.
+FAKE_FILE_AUTH_TAG = json.dumps(["auth", "f" * 64, "", "1" * 128])
+FAKE_ENV_AUTH_TAG = json.dumps(["auth", "e" * 64, "", "2" * 128])
 
 
 @pytest.fixture(autouse=True)
@@ -482,6 +490,209 @@ class TestCredentialResolution:
         assert _resolve_private_key() == "nsec1fromfile"
 
 
+class TestAuthTagResolution:
+    """The NIP-OA auth tag resolves like the private key: env, then the same
+    credentials JSON (configured or auto-discovered).  Hosted Builderlab
+    relays reject NIP-42 auth with 403 relay_membership_required when the tag
+    sitting in the credentials file never reaches the auth event."""
+
+    def test_env_auth_tag_wins_over_credentials_file(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        monkeypatch.setenv("BUZZ_AUTH_TAG", FAKE_ENV_AUTH_TAG)
+        assert _resolve_auth_tag() == FAKE_ENV_AUTH_TAG
+
+    def test_blank_env_auth_tag_falls_back_to_file(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": f"  {FAKE_FILE_AUTH_TAG}  "}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        monkeypatch.setenv("BUZZ_AUTH_TAG", "   ")
+        assert _resolve_auth_tag() == FAKE_FILE_AUTH_TAG
+
+    def test_one_credentials_file_serves_key_and_tag(self, monkeypatch, tmp_path):
+        """The documented credentials_file config selects a single source for
+        both the nsec and the auth tag."""
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        extra = {"credentials_file": str(creds)}
+        assert _resolve_private_key(extra) == "nsec1fromfile"
+        assert _resolve_auth_tag(extra) == FAKE_FILE_AUTH_TAG
+
+    def test_auto_discovered_credentials_file(self, monkeypatch, tmp_path):
+        creds_dir = tmp_path / "buzz-config"
+        creds_dir.mkdir()
+        (creds_dir / "hermes_credentials.json").write_text(
+            json.dumps({"nsec": "nsec1discovered", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(_buzz_mod, "_DEFAULT_CREDENTIALS_DIR", creds_dir)
+        assert _resolve_private_key() == "nsec1discovered"
+        assert _resolve_auth_tag() == FAKE_FILE_AUTH_TAG
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            json.dumps({"nsec": "nsec1fromfile"}),          # field absent
+            json.dumps({"auth_tag": ["auth", "f" * 64]}),   # non-string value
+            json.dumps({"auth_tag": "   "}),                # blank string
+            json.dumps(["not", "a", "dict"]),               # non-dict document
+            "{not json at all",                             # malformed
+        ],
+    )
+    def test_unusable_auth_tag_resolves_empty(self, monkeypatch, tmp_path, payload):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(payload, encoding="utf-8")
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+        assert _resolve_auth_tag() == ""
+
+    def test_unreadable_credentials_file_resolves_empty(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(tmp_path / "does-not-exist.json"))
+        assert _resolve_auth_tag() == ""
+
+
+class TestAuthTagReachesCli:
+    """Every buzz CLI subprocess must inherit the resolved auth tag, so hosted
+    relays accept the CLI's own NIP-42 handshake."""
+
+    @pytest.fixture
+    def spawned(self, monkeypatch):
+        """Capture the env of the subprocess ``_exec_buzz`` would spawn."""
+        captured = {}
+
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self, data=None):
+                return b"[]", b""
+
+        async def fake_spawn(cli_path, *args, **kwargs):
+            captured.update(cli_path=cli_path, args=list(args), env=kwargs.get("env") or {})
+            return _FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+        return captured
+
+    @pytest.mark.asyncio
+    async def test_exec_buzz_exports_auth_tag(self, spawned):
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"],
+            relay_url="https://r", private_key="nsec1x", auth_tag=FAKE_FILE_AUTH_TAG,
+        )
+        assert spawned["env"]["BUZZ_AUTH_TAG"] == FAKE_FILE_AUTH_TAG
+        assert spawned["env"]["BUZZ_RELAY_URL"] == "https://r"
+        assert spawned["env"]["BUZZ_PRIVATE_KEY"] == "nsec1x"
+        # Credentials travel by env only — never argv.
+        assert all(FAKE_FILE_AUTH_TAG not in str(a) for a in spawned["args"])
+        assert all("nsec1x" not in str(a) for a in spawned["args"])
+
+    @pytest.mark.asyncio
+    async def test_exec_buzz_leaves_auth_tag_unset_when_empty(self, monkeypatch, spawned):
+        monkeypatch.delenv("BUZZ_AUTH_TAG", raising=False)
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"], relay_url="https://r", private_key="nsec1x",
+        )
+        assert "BUZZ_AUTH_TAG" not in spawned["env"]
+
+    @pytest.mark.asyncio
+    async def test_exec_buzz_never_clobbers_inherited_auth_tag(self, monkeypatch, spawned):
+        """An unresolved tag must leave whatever the parent process exports
+        alone rather than blanking it out."""
+        monkeypatch.setenv("BUZZ_AUTH_TAG", FAKE_ENV_AUTH_TAG)
+        await _exec_buzz(
+            "/fake/buzz", ["users", "get"], relay_url="https://r", private_key="nsec1x",
+        )
+        assert spawned["env"]["BUZZ_AUTH_TAG"] == FAKE_ENV_AUTH_TAG
+
+    @pytest.mark.asyncio
+    async def test_run_cli_forwards_credentials_file_auth_tag(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        from gateway.config import PlatformConfig
+
+        adapter = BuzzAdapter(PlatformConfig(
+            enabled=True,
+            extra={"relay_url": "https://test.relay", "credentials_file": str(creds)},
+        ))
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="",
+                            input_text=None, timeout=30.0):
+            captured.update(private_key=private_key, auth_tag=auth_tag)
+            return 0, "[]", ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        await adapter._run_cli(["users", "get"])
+        assert captured == {"private_key": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}
+
+
+class TestAuthTagReachesWebSocket:
+    """The NIP-42 handshake must sign the resolved auth tag — reading only the
+    parent environment loses a tag that lives in the credentials file, which
+    hosted relays answer with 403 relay_membership_required."""
+
+    class _FakeWebSocket:
+        """Replays a NIP-42 handshake: AUTH challenge, then OK for the reply."""
+
+        def __init__(self):
+            self.sent = []
+
+        async def recv(self):
+            if self.sent:
+                return json.dumps(["OK", self.sent[0][1]["id"], True, "authenticated"])
+            return json.dumps(["AUTH", "relay-challenge"])
+
+        async def send(self, raw):
+            self.sent.append(json.loads(raw))
+
+    @pytest.mark.asyncio
+    async def test_auth_event_carries_credentials_file_auth_tag(self, monkeypatch, tmp_path):
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        from gateway.config import PlatformConfig
+
+        adapter = BuzzAdapter(PlatformConfig(
+            enabled=True,
+            extra={"relay_url": "https://test.relay", "credentials_file": str(creds)},
+        ))
+
+        signed = {}
+
+        def fake_build_auth_event(*, private_key, challenge, relay_url, auth_tag_json=""):
+            signed.update(private_key=private_key, auth_tag_json=auth_tag_json)
+            return {"id": "evt-auth", "kind": 22242}
+
+        monkeypatch.setattr(
+            _buzz_mod, "_load_nostr_auth",
+            lambda: MagicMock(build_auth_event=fake_build_auth_event),
+        )
+
+        async def fake_exec(cli_path, args, **kwargs):
+            return 0, "[]", ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        # The adapter lifecycle resolves credentials before the WS starts.
+        await adapter._run_cli(["users", "get"])
+
+        await adapter._authenticate_websocket(self._FakeWebSocket())
+        assert signed == {"private_key": "nsec1fromfile", "auth_tag_json": FAKE_FILE_AUTH_TAG}
+
+
 # ── Env enablement / registration / standalone send ──────────────────────
 
 
@@ -524,7 +735,8 @@ class TestStandaloneSend:
 
         captured = {}
 
-        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="",
+                            input_text=None, timeout=30.0):
             captured.update(cli_path=cli_path, args=args, relay_url=relay_url, input_text=input_text)
             return 0, json.dumps({"accepted": True, "event_id": "evt-cron", "message": ""}), ""
 
@@ -536,5 +748,37 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_forwards_credentials_file_auth_tag(self, monkeypatch, tmp_path):
+        """Out-of-process cron sends resolve the auth tag the same way the
+        live adapter does."""
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        creds = tmp_path / "agent_credentials.json"
+        creds.write_text(
+            json.dumps({"nsec": "nsec1fromfile", "auth_tag": FAKE_FILE_AUTH_TAG}),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        monkeypatch.setenv("BUZZ_CREDENTIALS_FILE", str(creds))
+
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="",
+                            input_text=None, timeout=30.0):
+            captured.update(private_key=private_key, auth_tag=auth_tag, args=args)
+            return 0, json.dumps({"accepted": True, "event_id": "evt-cron"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = await _standalone_send(PlatformConfig(enabled=True, extra={}), CHANNEL, "cron says hi")
+        assert result == {"success": True, "message_id": "evt-cron"}
+        assert captured["private_key"] == "nsec1fromfile"
+        assert captured["auth_tag"] == FAKE_FILE_AUTH_TAG
+        assert all(FAKE_FILE_AUTH_TAG not in str(a) for a in captured["args"])
 
 

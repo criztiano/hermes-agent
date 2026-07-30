@@ -23,17 +23,19 @@ Configuration in config.yaml::
             home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             poll_interval: 4           # seconds between poll sweeps
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
-            credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
+            credentials_file: ""       # JSON file holding the nsec (fallback for
+                                       #   BUZZ_PRIVATE_KEY) and, optionally, the
+                                       #   NIP-OA auth_tag (fallback for BUZZ_AUTH_TAG)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_AUTH_TAG
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
-``~/.hermes/.env``.  It is passed to the CLI via the subprocess
-environment and is never logged.
+``~/.hermes/.env``.  It, and the optional NIP-OA BUZZ_AUTH_TAG, are passed
+to the CLI via the subprocess environment and are never logged.
 """
 
 import asyncio
@@ -83,8 +85,9 @@ _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 
-# Where to look for a credentials JSON (keys: nsec / private_key_hex) when
-# BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
+# Where to look for a credentials JSON (keys: nsec / private_key_hex /
+# auth_tag) when BUZZ_PRIVATE_KEY / BUZZ_AUTH_TAG are not set.  Module-level
+# so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
 
 
@@ -221,14 +224,18 @@ def _resolve_cli_path(configured: str = "") -> str:
     return str(fallback) if fallback.is_file() else ""
 
 
-def _resolve_private_key(extra: Optional[dict] = None) -> str:
-    """Resolve the Nostr private key: env first, then a credentials JSON.
+def _credentials_documents(extra: Optional[dict] = None):
+    """Yield the parsed credentials JSON objects, in selection order.
 
-    NEVER log the return value.
+    One candidate list serves every credential a file can carry (private key,
+    NIP-OA auth tag): the configured path (BUZZ_CREDENTIALS_FILE or
+    ``credentials_file``, ``~`` expanded), else the auto-discovered
+    ``~/.config/buzz/*credentials*.json``.  A configured file is therefore the
+    single source for both; with auto-discovery each credential takes the
+    first candidate that provides it.  Unreadable, malformed, or non-object
+    files are skipped silently — their contents are never logged or surfaced
+    in an error.
     """
-    key = os.getenv("BUZZ_PRIVATE_KEY", "").strip()
-    if key:
-        return key
     configured = os.getenv("BUZZ_CREDENTIALS_FILE", "").strip() or (extra or {}).get("credentials_file", "")
     if configured:
         candidates = [Path(configured).expanduser()]
@@ -242,12 +249,40 @@ def _resolve_private_key(extra: Optional[dict] = None) -> str:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if not isinstance(data, dict):
-            continue
+        if isinstance(data, dict):
+            yield data
+
+
+def _resolve_private_key(extra: Optional[dict] = None) -> str:
+    """Resolve the Nostr private key: env first, then a credentials JSON.
+
+    NEVER log the return value.
+    """
+    key = os.getenv("BUZZ_PRIVATE_KEY", "").strip()
+    if key:
+        return key
+    for data in _credentials_documents(extra):
         for field in ("nsec", "private_key_hex", "private_key"):
             value = data.get(field)
             if isinstance(value, str) and value.strip():
                 return value.strip()
+    return ""
+
+
+def _resolve_auth_tag(extra: Optional[dict] = None) -> str:
+    """Resolve the NIP-OA owner-attestation auth tag JSON.
+
+    Same precedence as the private key: a non-empty BUZZ_AUTH_TAG, else the
+    ``auth_tag`` field of the selected credentials JSON.  Only a string value
+    counts; anything else resolves to "".  NEVER log the return value.
+    """
+    tag = os.getenv("BUZZ_AUTH_TAG", "").strip()
+    if tag:
+        return tag
+    for data in _credentials_documents(extra):
+        value = data.get("auth_tag")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
     return ""
 
 
@@ -257,18 +292,24 @@ async def _exec_buzz(
     *,
     relay_url: str,
     private_key: str,
+    auth_tag: str = "",
     input_text: Optional[str] = None,
     timeout: float = _CLI_TIMEOUT,
 ) -> Tuple[int, str, str]:
     """Run the buzz CLI with an argument list (never a shell) and return
     ``(returncode, stdout, stderr)``.
 
-    The private key travels via the subprocess environment only — it never
-    appears in argv, so process listings and error logs stay clean.
+    The private key and the NIP-OA auth tag travel via the subprocess
+    environment only — they never appear in argv, so process listings and
+    error logs stay clean.
     """
     env = os.environ.copy()
     env["BUZZ_RELAY_URL"] = relay_url
     env["BUZZ_PRIVATE_KEY"] = private_key
+    # Only export a resolved tag; an empty one must not clobber whatever the
+    # parent environment already provides.
+    if auth_tag:
+        env["BUZZ_AUTH_TAG"] = auth_tag
     proc = await asyncio.create_subprocess_exec(
         cli_path,
         *args,
@@ -387,10 +428,12 @@ class BuzzAdapter(BasePlatformAdapter):
             if isinstance(entry, str) and (normalized := _normalize_user_ref(entry))
         }
 
-        # Secret — resolved lazily (never at import/registration time and
-        # never logged).  connect() re-resolves it to fail fast with a clear
-        # error when it is missing.
+        # Secrets — resolved lazily (never at import/registration time and
+        # never logged).  connect() re-resolves them to fail fast with a clear
+        # error when the key is missing.  The auth tag is optional and shares
+        # the private key's resolution, so one credentials file serves both.
         self._private_key: str = ""
+        self._auth_tag: str = ""
 
         # Identity — filled in by connect() from ``buzz users get``
         self._self_pubkey: str = ""
@@ -419,14 +462,21 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
+    def _resolve_credentials(self) -> None:
+        """Resolve the private key and the NIP-OA auth tag together, off the
+        same credentials-file selection.  Never logged."""
+        self._private_key = _resolve_private_key(self._extra)
+        self._auth_tag = _resolve_auth_tag(self._extra)
+
     async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
         if not self._private_key:
-            self._private_key = _resolve_private_key(self._extra)
+            self._resolve_credentials()
         return await _exec_buzz(
             self.cli_path,
             args,
             relay_url=self.relay_url,
             private_key=self._private_key,
+            auth_tag=self._auth_tag,
             input_text=input_text,
         )
 
@@ -442,7 +492,7 @@ class BuzzAdapter(BasePlatformAdapter):
             logger.error("Buzz: buzz CLI binary not found (set BUZZ_CLI_PATH or put 'buzz' on PATH)")
             self._set_fatal_error("cli_missing", "buzz CLI binary not found", retryable=False)
             return False
-        self._private_key = _resolve_private_key(self._extra)
+        self._resolve_credentials()
         if not self._private_key:
             logger.error("Buzz: no private key (set BUZZ_PRIVATE_KEY or a credentials file)")
             self._set_fatal_error("config_missing", "BUZZ_PRIVATE_KEY must be set", retryable=False)
@@ -738,8 +788,9 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _authenticate_websocket(self, websocket) -> None:
         """NIP-42: wait for the relay's AUTH challenge, answer with a signed
-        kind-22242 event (plus the optional NIP-OA owner-attestation tag from
-        BUZZ_AUTH_TAG), and wait for the OK acknowledgment."""
+        kind-22242 event (plus the optional NIP-OA owner-attestation tag
+        resolved from BUZZ_AUTH_TAG or the credentials file), and wait for the
+        OK acknowledgment."""
         build_auth_event = _load_nostr_auth().build_auth_event
 
         raw = await asyncio.wait_for(websocket.recv(), timeout=_WS_AUTH_TIMEOUT)
@@ -750,7 +801,7 @@ class BuzzAdapter(BasePlatformAdapter):
             private_key=self._private_key,
             challenge=str(message[1]),
             relay_url=self._websocket_url(),
-            auth_tag_json=os.getenv("BUZZ_AUTH_TAG", ""),
+            auth_tag_json=self._auth_tag,
         )
         await websocket.send(json.dumps(["AUTH", event], separators=(",", ":")))
         while True:
@@ -1350,6 +1401,7 @@ async def _standalone_send(
     extra = getattr(pconfig, "extra", {}) or {}
     relay = (os.getenv("BUZZ_RELAY_URL") or extra.get("relay_url", "")).strip()
     private_key = _resolve_private_key(extra)
+    auth_tag = _resolve_auth_tag(extra)
     cli_path = _resolve_cli_path(
         os.getenv("BUZZ_CLI_PATH", "").strip() or str(extra.get("cli_path", "") or "")
     )
@@ -1368,7 +1420,12 @@ async def _standalone_send(
         args += ["--file", str(path)]
     try:
         code, out, err = await _exec_buzz(
-            cli_path, args, relay_url=relay, private_key=private_key, input_text=message
+            cli_path,
+            args,
+            relay_url=relay,
+            private_key=private_key,
+            auth_tag=auth_tag,
+            input_text=message,
         )
     except asyncio.CancelledError:
         raise
