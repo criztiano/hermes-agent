@@ -1007,4 +1007,54 @@ class TestStandaloneSend:
         assert captured["auth_tag"] == FAKE_FILE_AUTH_TAG
         assert all(FAKE_FILE_AUTH_TAG not in str(a) for a in captured["args"])
 
+    @pytest.mark.asyncio
+    async def test_standalone_send_passes_only_paths_from_media_tuples(self, monkeypatch, tmp_path):
+        """``send_message_tool`` hands media over as ``(path, is_voice)`` pairs
+        (``BasePlatformAdapter.extract_media`` /
+        ``filter_media_delivery_paths``). Each ``--file`` argument must be the
+        resolved path alone — a stringified tuple is an unopenable path to the
+        buzz CLI. Bare strings from callers that never adopted the pair
+        contract keep working."""
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        report = tmp_path / "report.txt"
+        voice = tmp_path / "voice.ogg"
+        legacy = tmp_path / "legacy.pdf"
+        for f in (report, voice, legacy):
+            f.write_text("x", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, auth_tag="",
+                            input_text=None, timeout=30.0):
+            captured.update(args=args, input_text=input_text)
+            return 0, json.dumps({"accepted": True, "event_id": "evt-media"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            CHANNEL,
+            "here are the files",
+            thread_id="evt-parent",
+            media_files=[(str(report), False), (str(voice), True), str(legacy)],
+        )
+
+        assert result == {"success": True, "message_id": "evt-media"}
+        args = captured["args"]
+        assert [args[i + 1] for i, a in enumerate(args) if a == "--file"] == [
+            str(report), str(voice), str(legacy),
+        ]
+        # Ordinary text still rides on stdin, and the reply target on argv.
+        assert captured["input_text"] == "here are the files"
+        assert args[args.index("--reply-to") + 1] == "evt-parent"
+        # Neither the key nor the is_voice flag leaks into argv.
+        assert all("nsec1x" not in str(a) for a in args)
+        assert all("False" not in str(a) and "True" not in str(a) for a in args)
+
 
