@@ -48,7 +48,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
@@ -1389,7 +1389,7 @@ async def _standalone_send(
     message: str,
     *,
     thread_id: Optional[str] = None,
-    media_files: Optional[List[str]] = None,
+    media_files: Optional[List[Union[str, Tuple[str, bool]]]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
     """One-shot send without a live adapter (out-of-process cron delivery).
@@ -1416,7 +1416,11 @@ async def _standalone_send(
     args = ["messages", "send", "--channel", target, "--content", "-"]
     if thread_id:
         args += ["--reply-to", str(thread_id)]
-    for path in media_files or []:
+    for entry in media_files or []:
+        # send_message_tool passes the core (path, is_voice) media contract;
+        # Buzz attaches every file the same way, so only the path is used.
+        # Stringifying the pair itself would hand the CLI an unopenable path.
+        path = entry[0] if isinstance(entry, tuple) else entry
         args += ["--file", str(path)]
     try:
         code, out, err = await _exec_buzz(
