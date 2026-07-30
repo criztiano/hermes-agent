@@ -105,6 +105,66 @@ class _FakeWebSocket:
 
 
 @pytest.mark.asyncio
+async def test_membership_subscription_is_authenticated_and_self_addressed():
+    """Live DM discovery rides a kind-44100 subscription opened after NIP-42
+    auth and filtered to events p-tagged to our own pubkey — the
+    self-addressed half of hosted-DM classification, which only takes effect
+    together with a DM-shaped `channels list` entry (see
+    `_is_hosted_dm_metadata`)."""
+    adapter = _make_adapter()
+    adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 100, "seen": {}}
+    websocket = _FakeWebSocket()
+
+    subscriptions = await adapter._subscribe_websocket(websocket)
+
+    membership_sub = _buzz_mod._WS_MEMBERSHIP_SUB_ID
+    assert subscriptions[membership_sub] is None  # not a per-channel sub
+    assert subscriptions["hermes-buzz-0"] == CHANNEL
+    frames = {f[1]: f[2] for f in websocket.sent if f[0] == "REQ"}
+    assert frames[membership_sub]["kinds"] == [_buzz_mod._WS_MEMBERSHIP_KIND]
+    assert frames[membership_sub]["#p"] == [SELF_PUBKEY]
+    assert frames["hermes-buzz-0"]["#h"] == [CHANNEL]
+
+
+@pytest.mark.asyncio
+async def test_membership_event_routes_hosted_dm_through_websocket_flow():
+    """End to end on the WS transport: `dms list` empty, DM-shaped fallback
+    metadata, a kind-44100 membership event, then a kind-9 owner message
+    carrying only an h-tag — it dispatches as a DM."""
+    hosted_dm = "4e645536-f4af-4d6d-8123-caebeeadd7ec"
+    adapter = _make_adapter()
+    dispatched = []
+
+    async def capture(**kwargs):
+        dispatched.append(kwargs)
+
+    adapter._dispatch_message = capture
+
+    async def fake_cli(args, *, input_text=None):
+        if args[:2] == ["channels", "list"]:
+            return 0, json.dumps([{"channel_id": hosted_dm, "name": "DM", "description": ""}]), ""
+        return 0, "[]", ""
+
+    adapter._run_cli = fake_cli
+
+    websocket = _FakeWebSocket()
+    subscriptions = {}
+    await adapter._handle_membership_event(websocket, subscriptions, {
+        "id": "m1", "kind": _buzz_mod._WS_MEMBERSHIP_KIND, "created_at": int(time.time()),
+        "pubkey": "a" * 64, "content": "",
+        "tags": [["p", SELF_PUBKEY], ["h", hosted_dm]],
+    })
+    assert hosted_dm in subscriptions.values()
+
+    state = adapter._channel_state[hosted_dm]
+    await adapter._handle_event(hosted_dm, state, {
+        "id": "e1", "kind": 9, "pubkey": "a" * 64, "created_at": int(time.time()),
+        "content": "here's a test message", "tags": [["h", hosted_dm]],
+    })
+    assert [d["chat_type"] for d in dispatched] == ["dm"]
+
+
+@pytest.mark.asyncio
 async def test_websocket_auth_raises_on_rejection():
     adapter = _make_adapter()
 

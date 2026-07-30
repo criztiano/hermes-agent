@@ -36,6 +36,9 @@ CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
 # [] for it (#68871) while `channels list` shows it as name "DM", empty
 # description, indistinguishable from a channel except via message p-tags.
 DM_CHANNEL = "6468cc16-a114-4f23-8b8c-02c1655cbf6b"
+# A second hosted-relay DM: same empty `dms list`, but its kind-9 messages
+# carry only ["h", <dm id>] — no p-tag for the latch to key off.
+HOSTED_DM = "4e645536-f4af-4d6d-8123-caebeeadd7ec"
 
 _ENV_VARS = (
     "BUZZ_RELAY_URL",
@@ -387,6 +390,229 @@ class TestDmClassification:
         assert a._may_reclassify_as_dm(DM_CHANNEL) is True
         assert CHANNEL not in a._channel_state
         assert a._may_reclassify_as_dm(CHANNEL) is False
+
+
+# ── Hosted-relay DMs discovered by kind-44100 membership events ──────────
+#
+# Second flavour of #68871, seen on https://fckall.communities.buzz.xyz:
+# `dms list` is empty, the DM only shows up in `channels list` as
+# name "DM"/empty description/no channel_type, AND the owner's kind-9
+# messages carry nothing but ["h", <dm id>] — no p-tag at all.  The p-tag
+# latch can never fire for those, so classification has to come from the
+# authenticated kind-44100 membership event that put the conversation in
+# front of us in the first place.
+
+
+class _RecordingWebSocket:
+    """Captures the frames the adapter sends; no relay round-trip."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+
+def _membership_event(*, conversation=None, created_at=5000, pubkey=OTHER_PUBKEY):
+    """A kind-44100 channel-membership event p-tagged to us, as delivered on
+    the authenticated (NIP-42) membership subscription."""
+    tags = [["p", SELF_PUBKEY]]
+    if conversation:
+        tags.append(["h", conversation])
+    return {
+        "id": "m1",
+        "pubkey": pubkey,
+        "kind": 44100,
+        "created_at": created_at,
+        "content": "",
+        "tags": tags,
+    }
+
+
+def _h_only_event(event_id, channel, *, content="here's a test message",
+                  pubkey=OTHER_PUBKEY, created_at=5001):
+    """Owner message exactly as the hosted relay emits it inside a DM:
+    kind 9 with a single ["h", <dm id>] tag and no p-tag."""
+    return {
+        "id": event_id,
+        "pubkey": pubkey,
+        "content": content,
+        "created_at": created_at,
+        "kind": 9,
+        "tags": [["h", channel]],
+    }
+
+
+class TestHostedDmMembershipDiscovery:
+
+    def _adapter(self, extra=None):
+        a = _make_adapter(extra)
+        a._dispatched = []
+
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        return a
+
+    def _cli(self, *channel_entries):
+        cli = _ScriptedCli()
+        cli.script("dms", "list", [])          # hosted relay: always empty
+        cli.script("channels", "list", list(channel_entries))
+        return cli
+
+    @pytest.mark.asyncio
+    async def test_membership_discovered_dm_dispatches_h_only_message(self):
+        """The reported bug end to end: `dms list` empty, DM-shaped fallback
+        metadata, discovery driven by an authenticated membership event, then
+        a kind-9 owner message with no p-tag — it must route as a DM."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": HOSTED_DM, "name": "DM", "description": ""},
+            {"channel_id": CHANNEL, "name": "general",
+             "description": "General conversation and community updates."},
+        )
+        websocket = _RecordingWebSocket()
+        subscriptions = {}
+
+        await a._handle_membership_event(
+            websocket, subscriptions, _membership_event(conversation=HOSTED_DM)
+        )
+
+        # The new conversation is watched and subscribed to over the WS.
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "dm"
+        assert HOSTED_DM in subscriptions.values()
+        assert [f[2]["#h"] for f in websocket.sent if f[0] == "REQ"] == [[HOSTED_DM]]
+        # The real channel is neither watched nor reclassified.
+        assert CHANNEL not in a._channel_state
+
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert [d["message_id"] for d in a._dispatched] == ["e1"]
+        assert a._dispatched[0]["chat_type"] == "dm"
+
+    @pytest.mark.asyncio
+    async def test_real_channel_named_dm_is_not_reclassified(self):
+        """Negative: a real channel that merely calls itself "DM" must not
+        become a DM or escape the mention gate, even when it shows up in the
+        same authenticated membership pass."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            # Real channels carry a channel_type; relay-materialized DMs don't.
+            {"channel_id": CHANNEL, "name": "DM", "description": "",
+             "channel_type": "channel"},
+        )
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=CHANNEL)
+        )
+
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+        await a._handle_event(
+            CHANNEL, a._channel_state[CHANNEL], _h_only_event("e1", CHANNEL)
+        )
+        assert a._dispatched == []
+        # Still reachable the normal way — the mention gate, not a mute.
+        await a._handle_event(
+            CHANNEL, a._channel_state[CHANNEL],
+            _h_only_event("e2", CHANNEL, content="@Chip ping", created_at=5002),
+        )
+        assert [d["chat_type"] for d in a._dispatched] == ["group"]
+
+    @pytest.mark.asyncio
+    async def test_configured_channel_named_dm_is_not_reclassified(self):
+        """A conversation the operator explicitly configured as a watched
+        channel stays a channel, whatever it is named."""
+        a = self._adapter({"channels": [CHANNEL]})
+        a._run_cli = self._cli({"channel_id": CHANNEL, "name": "DM", "description": ""})
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=CHANNEL)
+        )
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    async def test_membership_event_only_promotes_the_conversation_it_names(self):
+        """A membership event naming one conversation must not promote some
+        other DM-shaped entry that happens to appear in the same listing."""
+        other_dm = "11111111-2222-3333-4444-555555555555"
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": HOSTED_DM, "name": "DM", "description": ""},
+            {"channel_id": other_dm, "name": "DM", "description": ""},
+        )
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=HOSTED_DM)
+        )
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "dm"
+        assert a._channel_state[other_dm]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("conversations", [[], [HOSTED_DM, CHANNEL]])
+    async def test_membership_event_that_names_no_single_conversation_promotes_nothing(
+        self, conversations
+    ):
+        """Fail closed on shapes the relay is not known to emit: an event
+        naming no conversation — or several — promotes none of them, however
+        DM-shaped the listing looks."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": HOSTED_DM, "name": "DM", "description": ""},
+            {"channel_id": CHANNEL, "name": "DM", "description": ""},
+        )
+        event = _membership_event()
+        event["tags"] += [["h", c] for c in conversations]
+
+        await a._handle_membership_event(_RecordingWebSocket(), {}, event)
+
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "group"
+        assert a._channel_state[CHANNEL]["chat_type"] == "group"
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert a._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_typed_conversation_named_dm_is_not_reclassified(self):
+        """A ``channels list`` entry that carries any channel_type at all is
+        not the untyped hosted-DM shape, so it stays a channel."""
+        a = self._adapter()
+        a._run_cli = self._cli(
+            {"channel_id": HOSTED_DM, "name": "DM", "description": "", "channel_type": "dm"},
+        )
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=HOSTED_DM)
+        )
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "group"
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_discovery_keeps_group_classification(self):
+        """Without a membership event (startup seeding / poll sweeps), the
+        fallback listing alone never unlocks the DM path — name "DM" is not
+        evidence on its own."""
+        a = self._adapter()
+        a._run_cli = self._cli({"channel_id": HOSTED_DM, "name": "DM", "description": ""})
+        await a._discover_dms(seed=False)
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "group"
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert a._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_allowlist_still_gates_membership_discovered_dm(self):
+        """DM classification must not bypass the adapter allow-list."""
+        a = self._adapter()
+        a._allowed_pubkeys = {"b" * 64}
+        a._run_cli = self._cli({"channel_id": HOSTED_DM, "name": "DM", "description": ""})
+        await a._handle_membership_event(
+            _RecordingWebSocket(), {}, _membership_event(conversation=HOSTED_DM)
+        )
+        assert a._channel_state[HOSTED_DM]["chat_type"] == "dm"
+        await a._handle_event(
+            HOSTED_DM, a._channel_state[HOSTED_DM], _h_only_event("e1", HOSTED_DM)
+        )
+        assert a._dispatched == []
 
 
 # ── Sending ───────────────────────────────────────────────────────────────

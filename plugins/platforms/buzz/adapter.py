@@ -350,6 +350,25 @@ def _cli_error_message(stderr: str, returncode: int) -> str:
     return text or f"buzz CLI failed with exit code {returncode}"
 
 
+def _membership_conversation_id(event: dict) -> Optional[str]:
+    """The conversation a kind-44100 membership event names.
+
+    Buzz identifies a conversation with an ``h`` tag — the same tag its chat
+    messages carry and its subscriptions filter on.  Returns None when the
+    event names no conversation, or names more than one: neither is a shape
+    the relay is known to emit, and DM classification fails closed on both.
+    """
+    tags = event.get("tags")
+    if not isinstance(tags, list):
+        return None
+    ids = {
+        str(tag[1]).strip()
+        for tag in tags
+        if isinstance(tag, (list, tuple)) and len(tag) > 1 and tag[0] == "h" and str(tag[1]).strip()
+    }
+    return ids.pop() if len(ids) == 1 else None
+
+
 def _parse_json_list(stdout: str) -> List[dict]:
     """Parse CLI stdout expected to be a JSON array of objects."""
     try:
@@ -851,10 +870,17 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
         """A membership event p-tagged to us: rediscover conversations and
-        subscribe to any new ones (fresh DMs dispatch from their beginning)."""
+        subscribe to any new ones (fresh DMs dispatch from their beginning).
+
+        The frame arrived on the NIP-42-authenticated subscription filtered
+        to ``#p`` = our own pubkey, so it is addressed to this agent; the
+        conversation it names is passed to _discover_dms as the only
+        candidate for immediate DM classification (see "DM classification"
+        below for what the event does and does not prove).
+        """
         self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
         before = set(self._channel_state)
-        await self._discover_dms(seed=False)
+        await self._discover_dms(seed=False, membership_id=_membership_conversation_id(event))
         for channel_id in self._channel_state:
             if channel_id in before:
                 continue
@@ -972,7 +998,7 @@ class BuzzAdapter(BasePlatformAdapter):
             self._maybe_latch_dm(channel_id, state, event)
         self._trim_seen(state)
 
-    async def _discover_dms(self, *, seed: bool) -> None:
+    async def _discover_dms(self, *, seed: bool, membership_id: Optional[str] = None) -> None:
         """Watch DM conversations.  New ones found mid-run dispatch from their
         beginning (a fresh conversation has no history worth suppressing);
         ones present at startup are seeded like channels.
@@ -984,6 +1010,13 @@ class BuzzAdapter(BasePlatformAdapter):
         finds are watched as ``group`` and latch to ``dm`` via p-tag
         detection (_is_direct_message_event) rather than trusting the name
         alone to unlock the mention-free DM path.
+
+        ``membership_id`` is set ONLY by _handle_membership_event — the one
+        conversation a kind-44100 membership event addressed to us named.  If
+        that exact conversation is a new fallback find whose metadata is
+        DM-shaped, it is classified ``dm`` right away, because some hosted
+        relays never p-tag the messages inside a DM (see
+        _is_hosted_dm_metadata).  Every other find stays ``group``.
         """
         code, out, _err = await self._run_cli(["dms", "list"])
         if code == 0:
@@ -1008,10 +1041,17 @@ class BuzzAdapter(BasePlatformAdapter):
             self._channel_names.setdefault(ch_id, str(ch.get("name") or ch_id))
             if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
                 continue
+            chat_type = "group"
+            if ch_id == membership_id and self._is_hosted_dm_metadata(ch_id):
+                chat_type = "dm"
+                logger.info(
+                    "Buzz: conversation %s classified as DM (membership event + DM-shaped listing)",
+                    ch_id,
+                )
             if seed:
-                await self._seed_channel(ch_id, chat_type="group")
+                await self._seed_channel(ch_id, chat_type=chat_type)
             else:
-                self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+                self._channel_state[ch_id] = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
@@ -1110,6 +1150,33 @@ class BuzzAdapter(BasePlatformAdapter):
     # "DM" with an empty description.  Nothing is lost while unlatched: a
     # DM message that DOES mention us dispatches through the mention gate
     # anyway, so the latch flips exactly on the first message that needs it.
+    #
+    # One relay shape defeats the p-tag latch entirely: on
+    # fckall.communities.buzz.xyz the owner's kind-9 messages inside a DM
+    # carry ONLY ["h", <dm id>] — no p-tag ever arrives, so an un-mentioned
+    # DM stays stuck behind the channel mention gate forever.  For those,
+    # classification comes from the discovery path instead, and it takes two
+    # independent facts:
+    #
+    #   * a kind-44100 membership event, delivered on the NIP-42-authenticated
+    #     subscription filtered ``#p`` = our own pubkey, NAMES the conversation
+    #     (one ``h`` tag).  This is what the event contributes: it is addressed
+    #     to us and it points at exactly one conversation.  It is not proof of
+    #     membership on its own — the event is signed by whoever published it,
+    #     not by us — so it never classifies anything by itself;
+    #   * that same conversation is newly present in OUR OWN authenticated
+    #     ``channels list`` with the hosted-DM shape (name "DM", no
+    #     description, untyped, not operator-configured).  The listing is the
+    #     membership evidence: the relay only lists conversations this
+    #     identity belongs to.
+    #
+    # Both together classify a DM; neither half does so alone, and everything
+    # else fails closed — an event naming no conversation (or several) promotes
+    # nothing, an unauthenticated poll sweep or startup listing never promotes
+    # anything, and a typed / described / configured channel is excluded.
+    # A real channel that is genuinely named "DM", untyped and undescribed
+    # remains indistinguishable from a materialized DM by design; the operator
+    # can pin it via the configured `channels` list.
 
     def _may_reclassify_as_dm(self, channel_id: str) -> bool:
         """True when the conversation's metadata does not rule out a DM.
@@ -1125,6 +1192,27 @@ class BuzzAdapter(BasePlatformAdapter):
         name = str(meta.get("name") or "").strip()
         description = str(meta.get("description") or "").strip()
         return name == "DM" and not description
+
+    def _is_hosted_dm_metadata(self, channel_id: str) -> bool:
+        """True when ``channels list`` describes this conversation as a
+        relay-materialized DM rather than a community channel.
+
+        Stricter than _may_reclassify_as_dm, because this is the predicate
+        that (together with an authenticated membership event) unlocks the
+        mention-free DM path outright instead of merely allowing a p-tagged
+        message to do it:  the entry must match the observed hosted-DM shape
+        exactly — named "DM", no description, and no channel_type field at
+        all (the relay types real channels and leaves materialized DMs
+        untyped) — and must not be a channel the operator asked to watch.
+        Any other channel_type value, known or not, fails closed.
+        """
+        meta = self._channel_meta.get(channel_id)
+        if not isinstance(meta, dict) or channel_id in self.channels:
+            return False
+        name = str(meta.get("name") or "").strip()
+        description = str(meta.get("description") or "").strip()
+        channel_type = str(meta.get("channel_type") or "").strip()
+        return name == "DM" and not description and not channel_type
 
     def _is_direct_message_event(self, channel_id: str, event: dict) -> bool:
         """True when ``event`` is shaped like a direct message to us: a chat
